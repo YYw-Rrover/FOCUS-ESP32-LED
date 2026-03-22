@@ -1,0 +1,2 @@
+source /home/yyw/FOCUS-ESP32-LED/build/bootloader/gdbinit/symbols
+source /home/yyw/FOCUS-ESP32-LED/build/bootloader/gdbinit/connect
