@@ -1,0 +1,321 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <math.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "driver/i2s_std.h"
+#include "driver/ledc.h"
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_timer.h"
+
+#define TAG "TASK6_FFT"
+
+/* =========================
+ * 1. LED 配置
+ * ========================= */
+#define LED_GPIO          18
+#define LEDC_SPEED_MODE   LEDC_LOW_SPEED_MODE
+#define LEDC_TIMER        LEDC_TIMER_0
+#define LEDC_CHANNEL      LEDC_CHANNEL_0
+#define LEDC_RESOLUTION   LEDC_TIMER_13_BIT
+#define LEDC_FREQ_HZ      5000
+#define LEDC_MAX_DUTY     ((1 << 13) - 1)
+
+/* =========================
+ * 2. INMP441 配置
+ * ========================= */
+#define I2S_BCLK_GPIO     4   // SCK
+#define I2S_WS_GPIO       5   // WS
+#define I2S_DIN_GPIO      6   // SD
+
+#define SAMPLE_RATE       16000
+#define FRAME_SAMPLES     256
+
+/* =========================
+ * 3. 低频检测参数
+ * ========================= */
+#define LOW_BIN_START         2
+#define LOW_BIN_END           4
+#define LOW_FREQ_THRESHOLD    5.0e10f
+#define TRIGGER_COUNT_NEEDED  5
+#define TRIGGER_COOLDOWN_MS   3500
+#define STARTUP_IGNORE_MS     4000
+#define BLINK_DURATION_MS     4000
+
+static i2s_chan_handle_t rx_chan;
+
+/* =========================
+ * 4. LED 模式
+ * ========================= */
+typedef enum {
+    LED_MODE_OFF = 0,
+    LED_MODE_BLINK
+} led_mode_t;
+
+static struct {
+    led_mode_t mode;
+    uint32_t duty;
+} g_led = {
+    .mode = LED_MODE_OFF,
+    .duty = 0,
+};
+
+/* =========================
+ * 5. LED 控制
+ * ========================= */
+static void ledc_init_simple(void)
+{
+    ledc_timer_config_t timer_cfg = {
+        .speed_mode      = LEDC_SPEED_MODE,
+        .timer_num       = LEDC_TIMER,
+        .duty_resolution = LEDC_RESOLUTION,
+        .freq_hz         = LEDC_FREQ_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+
+    esp_err_t ret = ledc_timer_config(&timer_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ledc_timer_config failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ledc_channel_config_t channel_cfg = {
+        .gpio_num   = LED_GPIO,
+        .speed_mode = LEDC_SPEED_MODE,
+        .channel    = LEDC_CHANNEL,
+        .timer_sel  = LEDC_TIMER,
+        .duty       = 0,
+        .hpoint     = 0,
+    };
+
+    ret = ledc_channel_config(&channel_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ledc_channel_config failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ESP_LOGI(TAG, "LEDC init done");
+}
+
+static void led_apply_duty(uint32_t duty)
+{
+    if (duty > LEDC_MAX_DUTY) {
+        duty = LEDC_MAX_DUTY;
+    }
+
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_SPEED_MODE, LEDC_CHANNEL, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_SPEED_MODE, LEDC_CHANNEL));
+    g_led.duty = duty;
+}
+
+static void led_set_mode(led_mode_t mode)
+{
+    g_led.mode = mode;
+
+    switch (mode) {
+        case LED_MODE_OFF:
+            led_apply_duty(0);
+            ESP_LOGI(TAG, "LED -> OFF");
+            break;
+
+        case LED_MODE_BLINK:
+            ESP_LOGI(TAG, "LED -> BLINK");
+            break;
+
+        default:
+            break;
+    }
+}
+
+/* =========================
+ * 6. 闪烁任务
+ * ========================= */
+static void blink_task(void *arg)
+{
+    bool blink_on = false;
+
+    while (1) {
+        if (g_led.mode == LED_MODE_BLINK) {
+            led_apply_duty(blink_on ? 0 : LEDC_MAX_DUTY);
+            blink_on = !blink_on;
+            vTaskDelay(pdMS_TO_TICKS(300));
+        } else {
+            blink_on = false;
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+}
+
+/* =========================
+ * 7. I2S 麦克风初始化
+ * ========================= */
+static void i2s_mic_init(void)
+{
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chan_cfg.auto_clear = true;
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &rx_chan));
+
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+        .slot_cfg = (i2s_std_slot_config_t) {
+            .data_bit_width = I2S_DATA_BIT_WIDTH_32BIT,
+            .slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT,
+            .slot_mode = I2S_SLOT_MODE_MONO,
+            .slot_mask = I2S_STD_SLOT_LEFT,
+            .ws_width = 32,
+            .ws_pol = false,
+            .bit_shift = true,
+        },
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = I2S_BCLK_GPIO,
+            .ws   = I2S_WS_GPIO,
+            .dout = I2S_GPIO_UNUSED,
+            .din  = I2S_DIN_GPIO,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv   = false,
+            },
+        },
+    };
+
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_chan, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(rx_chan));
+
+    ESP_LOGI(TAG, "I2S mic init done");
+}
+
+/* =========================
+ * 8. 去直流
+ * ========================= */
+static void remove_dc_and_convert(const int32_t *in, float *out, int n)
+{
+    double mean = 0.0;
+
+    for (int i = 0; i < n; i++) {
+        mean += (double)(in[i] >> 8);
+    }
+    mean /= n;
+
+    for (int i = 0; i < n; i++) {
+        out[i] = (float)((in[i] >> 8) - mean);
+    }
+}
+
+/* =========================
+ * 9. 计算低频能量
+ *    这里按 FFT 思路取 bin 1~6
+ * ========================= */
+static float calc_low_freq_energy(const float *x, int n)
+{
+    float total_energy = 0.0f;
+
+    for (int k = LOW_BIN_START; k <= LOW_BIN_END; k++) {
+        float real = 0.0f;
+        float imag = 0.0f;
+
+        for (int t = 0; t < n; t++) {
+            float angle = 2.0f * (float)M_PI * k * t / n;
+            real += x[t] * cosf(angle);
+            imag -= x[t] * sinf(angle);
+        }
+
+        float power = real * real + imag * imag;
+        total_energy += power;
+    }
+
+    return total_energy;
+}
+
+/* =========================
+ * 10. 音频检测任务
+ * ========================= */
+static void audio_task(void *arg)
+{
+    int32_t samples[FRAME_SAMPLES];
+    float fft_in[FRAME_SAMPLES];
+    size_t bytes_read = 0;
+
+    int64_t start_time_ms = esp_timer_get_time() / 1000;
+    int64_t last_trigger_time = 0;
+    int high_count = 0;
+
+    while (1) {
+        esp_err_t ret = i2s_channel_read(
+            rx_chan,
+            samples,
+            sizeof(samples),
+            &bytes_read,
+            pdMS_TO_TICKS(1000)
+        );
+
+        if (ret == ESP_OK && bytes_read > 0) {
+            int sample_count = bytes_read / sizeof(int32_t);
+
+            remove_dc_and_convert(samples, fft_in, sample_count);
+            float low_energy = calc_low_freq_energy(fft_in, sample_count);
+
+            int64_t now_ms = esp_timer_get_time() / 1000;
+
+            ESP_LOGI(TAG, "low_energy=%.2f", low_energy);
+
+            /* 上电前几秒忽略 */
+            if ((now_ms - start_time_ms) < STARTUP_IGNORE_MS) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
+
+            /* 连续超过阈值才算有效 */
+            if (low_energy > LOW_FREQ_THRESHOLD) {
+                high_count++;
+            } else {
+                high_count = 0;
+            }
+
+            /* 只有当前不在闪烁状态时才允许触发 */
+            if (g_led.mode != LED_MODE_BLINK &&
+                high_count >= TRIGGER_COUNT_NEEDED &&
+                (now_ms - last_trigger_time) > TRIGGER_COOLDOWN_MS) {
+
+                ESP_LOGI(TAG, "Low frequency detected! Trigger BLINK");
+                led_set_mode(LED_MODE_BLINK);
+                last_trigger_time = now_ms;
+                high_count = 0;
+            }
+
+            /* 闪 4 秒后自动停 */
+            if (g_led.mode == LED_MODE_BLINK &&
+                (now_ms - last_trigger_time) > BLINK_DURATION_MS) {
+                led_set_mode(LED_MODE_OFF);
+            }
+
+        } else {
+            ESP_LOGW(TAG, "i2s read timeout or error");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+/* =========================
+ * 11. 主函数
+ * ========================= */
+void app_main(void)
+{
+    ESP_LOGI(TAG, "===== NOW RUNNING: TASK6 FFT VERSION =====");
+
+    ledc_init_simple();
+    led_set_mode(LED_MODE_OFF);
+
+    i2s_mic_init();
+
+    xTaskCreate(blink_task, "blink_task", 2048, NULL, 4, NULL);
+    xTaskCreate(audio_task, "audio_task", 6144, NULL, 5, NULL);
+}
