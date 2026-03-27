@@ -1,0 +1,238 @@
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "driver/ledc.h"
+#include "driver/uart.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+
+/* ─────────────────── 常量定义 ─────────────────── */
+
+#define TAG               "LEDC_CTRL"
+
+/* LEDC 配置 */
+#define LEDC_GPIO         18
+#define LEDC_SPEED_MODE   LEDC_LOW_SPEED_MODE   /* S3 仅支持低速模式 */
+#define LEDC_TIMER        LEDC_TIMER_0
+#define LEDC_CHANNEL      LEDC_CHANNEL_0
+#define LEDC_RESOLUTION   LEDC_TIMER_13_BIT     /* 13-bit → 0 ~ 8191 */
+#define LEDC_FREQ_HZ      5000                  /* PWM 频率 5 kHz */
+#define LEDC_MAX_DUTY     ((1 << 13) - 1)       /* 8191，括号保证宏安全 */
+
+/* UART 配置（UART_NUM_0 = 默认串口） */
+#define UART_PORT         UART_NUM_0
+#define UART_BAUD         115200
+#define UART_BUF_SIZE     256
+
+/* 行缓冲区最大长度 */
+#define LINE_BUF_MAX      64
+
+/* ─────────────────── LEDC 初始化 ─────────────────── */
+
+static void ledc_init(void)
+{
+    /* 1. 配置定时器 */
+    ledc_timer_config_t timer_cfg = {
+        .speed_mode      = LEDC_SPEED_MODE,
+        .timer_num       = LEDC_TIMER,
+        .duty_resolution = LEDC_RESOLUTION,
+        .freq_hz         = LEDC_FREQ_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg));
+
+    /* 2. 配置通道 */
+    ledc_channel_config_t channel_cfg = {
+        .gpio_num   = LEDC_GPIO,
+        .speed_mode = LEDC_SPEED_MODE,
+        .channel    = LEDC_CHANNEL,
+        .timer_sel  = LEDC_TIMER,
+        .duty       = 0,
+        .hpoint     = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&channel_cfg));
+}
+
+/* ─────────────────── 亮度设置辅助函数 ─────────────────── */
+
+/* 记录当前占空比，供相对增减指令使用 */
+static uint32_t current_duty = 0;
+
+static void set_duty(uint32_t duty)
+{
+    /* 限幅：防止超出 13-bit 范围 */
+        if (duty > LEDC_MAX_DUTY) {
+        ESP_LOGW(TAG, "占空比 %lu 超出范围，已限幅至 %d", duty, LEDC_MAX_DUTY);
+        duty = LEDC_MAX_DUTY;
+    }
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_SPEED_MODE, LEDC_CHANNEL, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_SPEED_MODE, LEDC_CHANNEL));
+    current_duty = duty;   /* 同步状态 */
+    ESP_LOGI(TAG, "占空比已设置为 %lu / %d", duty, LEDC_MAX_DUTY);
+}
+
+/* ─────────────────── 指令解析 ─────────────────── */
+
+static void process_line(const char *line)
+{
+    if (strcmp(line, "on") == 0) {
+        printf("\r\n[CMD] LED ON\r\n");
+        set_duty(LEDC_MAX_DUTY);
+
+    } else if (strcmp(line, "off") == 0) {
+        printf("\r\n[CMD] LED OFF\r\n");
+        set_duty(0);
+
+    } else if (strncmp(line, "set:", 4) == 0) {
+        /* 解析 "set:XXXX" 中的数字 */
+        int val = atoi(line + 4);
+        if (val < 0) val = 0;
+        printf("\r\n[CMD] SET duty = %d\r\n", val);
+        set_duty((uint32_t)val);
+
+    } else if (line[0] == '+') {
+        /* 相对增加：+XXXX
+         * 用 int32_t 做加法，再夹紧到 [0, LEDC_MAX_DUTY]，
+         * 避免 uint32_t 溢出绕回。 */
+        int delta = atoi(line + 1);   /* 跳过 '+' */
+        if (delta < 0) delta = 0;     /* 防止 "+(-X)" 这类异常输入 */
+        int32_t new_duty = (int32_t)current_duty + delta;
+        if (new_duty > LEDC_MAX_DUTY) new_duty = LEDC_MAX_DUTY;
+        printf("\r\n[CMD] +%d  (%lu → %ld)\r\n", delta, current_duty, new_duty);
+        set_duty((uint32_t)new_duty);
+
+    } else if (line[0] == '-') {
+        /* 相对减少：-XXXX
+         * 用 int32_t 做减法，再夹紧到 [0, LEDC_MAX_DUTY]，
+         * 防止下溢变成超大 uint32_t。 */
+        int delta = atoi(line + 1);   /* 跳过 '-' */
+        if (delta < 0) delta = 0;
+        int32_t new_duty = (int32_t)current_duty - delta;
+        if (new_duty < 0) new_duty = 0;
+        printf("\r\n[CMD] -%d  (%lu → %ld)\r\n", delta, current_duty, new_duty);
+        set_duty((uint32_t)new_duty);
+
+    } else if (strlen(line) > 0) {
+        /* 未知指令 */
+        printf("\r\n[ERR] 未知指令: \"%s\"\r\n", line);
+        printf("      可用指令: on | off | set:0~8191 | +XXXX | -XXXX\r\n");
+    }
+
+    /* 打印提示符 */
+    printf("> ");
+    fflush(stdout);
+}
+
+/* ─────────────────── 串口控制任务 ─────────────────── */
+
+static void uart_ctrl_task(void *arg)
+{
+    /* 行缓冲区 */
+    static char line_buf[LINE_BUF_MAX];
+    int line_pos = 0;
+
+    uint8_t byte;
+
+    printf("> ");   /* 首次提示符 */
+    fflush(stdout);
+
+    while (1) {
+        /* 每次读取 1 个字节，超时 100 ms */
+        int len = uart_read_bytes(UART_PORT, &byte, 1, pdMS_TO_TICKS(100));
+
+        /* [DEBUG] 仅当实际读到数据时打印，避免刷屏 */
+        if (len > 0) {
+            ESP_LOGD(TAG, "[DEBUG] Received raw len: %d, byte: 0x%02X ('%c')",
+                     len, byte, (byte >= 0x20 && byte < 0x7F) ? byte : '.');
+        }
+
+        if (len <= 0) {
+            /* 超时，继续等待 */
+            continue;
+        }
+
+        /* ── 回车 / 换行：触发指令解析 ── */
+        if (byte == '\r' || byte == '\n') {
+            line_buf[line_pos] = '\0';  /* 结束字符串 */
+            process_line(line_buf);     /* 解析并执行 */
+            line_pos = 0;               /* 重置缓冲区 */
+            continue;
+        }
+
+        /* ── 退格键处理（提升终端体验） ── */
+        if (byte == 0x7F || byte == '\b') {
+            if (line_pos > 0) {
+                line_pos--;
+                /* 终端退格：光标后退 + 空格覆盖 + 再后退 */
+                putchar('\b');
+                putchar(' ');
+                putchar('\b');
+                fflush(stdout);
+            }
+            continue;
+        }
+
+        /* ── 普通可打印字符 ── */
+        if (byte >= 0x20 && byte < 0x7F) {
+            if (line_pos < LINE_BUF_MAX - 1) {
+                line_buf[line_pos++] = (char)byte;
+                /* 回显字符到终端 */
+                putchar((char)byte);
+                fflush(stdout);
+            } else {
+                /* 缓冲区满，忽略多余字符并给出提示 */
+                printf("\r\n[WARN] 行缓冲区已满，请发送回车执行或重新输入\r\n> ");
+                fflush(stdout);
+                line_pos = 0;
+            }
+        }
+    }
+}
+
+/* ─────────────────── 主函数 ─────────────────── */
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "=== ESP32-S3 串口控光程序启动 ===");
+    ESP_LOGI(TAG, "LEDC GPIO: %d | 分辨率: 13-bit | 最大占空比: %d", LEDC_GPIO, LEDC_MAX_DUTY);
+
+    /* 1. 初始化 LEDC */
+    ledc_init();
+
+    /* ── 硬件自检：延迟 2 秒后强制点亮，排除 LED 接反 / 引脚接错 ── */
+    ESP_LOGI(TAG, "[自检] 等待 2 秒后强制设置占空比 1000，请观察 LED 是否亮起...");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    set_duty(1000);
+    ESP_LOGI(TAG, "[自检] 占空比已设置为 1000。若 LED 无反应，请检查接线。");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    /* 自检结束，关闭 LED，等待串口指令 */
+    set_duty(0);
+    ESP_LOGI(TAG, "[自检] 关闭 LED，进入串口控制模式。");
+
+    /* 2. 初始化 UART0*/
+    uart_config_t uart_cfg = {
+        .baud_rate  = UART_BAUD,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+    };
+    ESP_ERROR_CHECK(uart_param_config(UART_PORT, &uart_cfg));
+    /* TX=1, RX=3（S3 默认），若已由系统占用此步可省略 */
+    ESP_ERROR_CHECK(uart_set_pin(UART_PORT,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(UART_PORT, UART_BUF_SIZE, 0, 0, NULL, 0));
+
+    ESP_LOGI(TAG, "串口初始化完成，波特率 %d bps", UART_BAUD);
+    ESP_LOGI(TAG, "指令格式：on | off | set:0~8191 | +XXXX | -XXXX，输入后按 Enter");
+
+    /* 3. 启动串口控制任务 */
+    xTaskCreate(uart_ctrl_task, "uart_ctrl", 4096, NULL, 5, NULL);
+}
