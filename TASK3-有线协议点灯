@@ -65,7 +65,7 @@ static uint32_t current_duty = 0;
 static void set_duty(uint32_t duty)
 {
     /* 限幅：防止超出 13-bit 范围 */
-    if (duty > LEDC_MAX_DUTY) {
+        if (duty > LEDC_MAX_DUTY) {
         ESP_LOGW(TAG, "占空比 %lu 超出范围，已限幅至 %d", duty, LEDC_MAX_DUTY);
         duty = LEDC_MAX_DUTY;
     }
@@ -214,11 +214,7 @@ void app_main(void)
     set_duty(0);
     ESP_LOGI(TAG, "[自检] 关闭 LED，进入串口控制模式。");
 
-    /* 2. 初始化 UART0
-     *    注意：ESP-IDF v5.x 中 UART0 已由 esp_console 或 VFS 占用，
-     *    若同时使用 printf/ESP_LOGI，建议只调用 uart_driver_install，
-     *    不要再重复配置波特率（保持 menuconfig 中的默认值 115200）。
-     */
+    /* 2. 初始化 UART0*/
     uart_config_t uart_cfg = {
         .baud_rate  = UART_BAUD,
         .data_bits  = UART_DATA_8_BITS,
